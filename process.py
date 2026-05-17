@@ -265,7 +265,8 @@ def main() -> int:
     js_array = "[\n" + ",\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n]"
 
     html = HTML_TEMPLATE.replace(TEMPLATE_TOKEN, js_array)
-    (OUT_DIR / "index.html").write_text(html, encoding="utf-8")
+    html_path = Path(__file__).parent / "index.html"
+    html_path.write_text(html, encoding="utf-8")
 
     # ---- summary ----
     monthly_keys = sorted({(r["year"], r["month"]) for r in monthly_records})
@@ -278,7 +279,7 @@ def main() -> int:
     print(f"Yearly range:  {yearly_keys[0]}  ..  {yearly_keys[-1]}")
     print(f"Anomalies (negative deltas): {anomalies}")
     print(f"Wrote {ndjson_path}")
-    print(f"Wrote {OUT_DIR / 'index.html'}")
+    print(f"Wrote {html_path}")
     return 0
 
 
@@ -287,7 +288,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>Thailand Car Registrations</title>
-<script src="vendor/chart.umd.min.js"></script>
+<script src="output/vendor/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #fafafa; --fg: #222; --muted: #666; --border: #e0e0e0;

@@ -17,4 +17,4 @@ fi
 .venv/bin/python process.py
 
 echo
-echo "Open: file://$(pwd)/output/index.html"
+echo "Open: file://$(pwd)/index.html"
