@@ -1,0 +1,5 @@
+Go to this page: https://web.dlt.go.th/statistics/index.php
+Go to:  สถิติรถจดทะเบียนสะสม ณ วันที่ 30 เมษายน 2569 
+Click on button: แยกประเภท   
+Then Click on: จำนวนรถจดทะเบียน (สะสม) ตามกฎหมายว่าด้วยรถยนต์ จำแนกตามยี่ห้อ ณ วันที่
+and select the appropriate month to dowload
