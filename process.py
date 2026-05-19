@@ -31,6 +31,15 @@ TEMPLATE_TOKEN = "__DATA_NDJSON__"
 FILE_10663 = DATA_DIR / "10663.xlsx"  # brand/model
 FILE_10662 = DATA_DIR / "10662.xlsx"  # brand/fuel
 
+# Manual model-mapping workflow: user maintains model_aliases.json
+# (canonical, read every run, applied during aggregation). process.py
+# also emits a fresh proposal pair every run so the user can review
+# additional candidate mergers and copy them in.
+MODEL_ALIASES_FILE = ROOT / "model_aliases.json"
+MODEL_ALIASES_PROPOSAL_JSON = ROOT / "model_aliases_proposal.json"
+MODEL_ALIASES_PROPOSAL_MD = ROOT / "model_aliases_proposal.md"
+MIN_MODEL_VOLUME = 3  # drop model aggregates with grand total < 3 (i.e., <=2)
+
 THAI_MONTHS = {
     "มกราคม": 1, "กุมภาพันธ์": 2, "มีนาคม": 3, "เมษายน": 4,
     "พฤษภาคม": 5, "มิถุนายน": 6, "กรกฎาคม": 7, "สิงหาคม": 8,
@@ -64,6 +73,38 @@ def is_coded_model(name: str) -> bool:
     if not CODE_MODEL_RE.fullmatch(name):
         return False  # has spaces / dashes / dots / parens -> looks like a real name
     return any(c.isdigit() for c in name) and any(c.isalpha() for c in name)
+
+
+def load_model_aliases() -> dict[tuple[str, str], str]:
+    """Read model_aliases.json -> {(BRAND, RAW): CANONICAL}.
+
+    Both keys are upper-cased to match the normalization applied during
+    parsing. If the file doesn't exist, create an empty `{}` skeleton so
+    the user has somewhere to add entries.
+    """
+    if not MODEL_ALIASES_FILE.exists():
+        MODEL_ALIASES_FILE.write_text("{}\n", encoding="utf-8")
+        return {}
+    try:
+        data = json.loads(MODEL_ALIASES_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"WARN: {MODEL_ALIASES_FILE.name} is not valid JSON: {exc}",
+              file=sys.stderr)
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    if not isinstance(data, dict):
+        return out
+    for brand, mapping in data.items():
+        if not isinstance(mapping, dict):
+            continue
+        b = str(brand).strip().upper()
+        for raw, canonical in mapping.items():
+            r = str(raw).strip().upper()
+            c = str(canonical).strip().upper()
+            if not r or not c:
+                continue
+            out[(b, r)] = c
+    return out
 
 
 def be_to_ad(y) -> int:
@@ -113,12 +154,13 @@ def stream_data_sheet(path: Path):
         wb.close()
 
 
-def read_10663(path: Path):
+def read_10663(path: Path, aliases: dict[tuple[str, str], str]):
     """Return aggregates from 10663 (brand × model granularity).
 
     Returns dict with keys: brand_monthly, brand_yearly, model_monthly,
-    model_yearly, brand_total, model_total, vtypes (code -> label).
-    Counters are keyed by tuples and produce int totals.
+    model_yearly, brand_total, model_total, raw_model_total, vtypes,
+    alias_apply_count. The raw_model_total uses pre-alias keys (so the
+    proposal generator can suggest mergers based on original names).
     """
     print(f"Reading {path.name} ...")
     brand_m: dict[tuple, int] = defaultdict(int)   # (brand, vt, year, month)
@@ -127,8 +169,10 @@ def read_10663(path: Path):
     model_y: dict[tuple, int] = defaultdict(int)   # (brand, model, vt, year)
     brand_total: dict[str, int] = defaultdict(int)
     model_total: dict[tuple[str, str], int] = defaultdict(int)
+    raw_model_total: dict[tuple[str, str], int] = defaultdict(int)
     vtypes: dict[str, str] = {}
     n_rows = 0
+    alias_apply_count = 0
     dropped_rows = 0
     dropped_vehicles = 0
     dropped_model_names: set[str] = set()
@@ -183,6 +227,15 @@ def read_10663(path: Path):
             dropped_model_names.add(model)
             continue
 
+        # Track the raw (pre-alias) volume for the proposal generator.
+        raw_model_total[(brand, model)] += c
+
+        # Apply canonical alias if user has mapped this (brand, raw) pair.
+        canonical = aliases.get((brand, model))
+        if canonical is not None:
+            model = canonical
+            alias_apply_count += 1
+
         model_m[(brand, model, vt_code, year, month)] += c
         model_y[(brand, model, vt_code, year)] += c
         model_total[(brand, model)] += c
@@ -193,13 +246,15 @@ def read_10663(path: Path):
               f"({len(dropped_model_names):,} distinct names, "
               f"{dropped_vehicles:,} vehicles)")
     return {
-        "brand_monthly": brand_m,
-        "brand_yearly":  brand_y,
-        "model_monthly": model_m,
-        "model_yearly":  model_y,
-        "brand_total":   brand_total,
-        "model_total":   model_total,
-        "vtypes":        vtypes,
+        "brand_monthly":     brand_m,
+        "brand_yearly":      brand_y,
+        "model_monthly":     model_m,
+        "model_yearly":      model_y,
+        "brand_total":       brand_total,
+        "model_total":       model_total,
+        "raw_model_total":   raw_model_total,
+        "vtypes":            vtypes,
+        "alias_apply_count": alias_apply_count,
     }
 
 
@@ -278,6 +333,172 @@ def cross_check(b663: dict, b662: dict, tolerance: int = 100) -> int:
     return discrepancies
 
 
+# Spec-word tokens that suggest a longer name is a genuinely different
+# trim/derivative the user might prefer to keep separate (the proposal
+# .md flags these with a ⚠ marker so the user reviews carefully).
+DISTINCT_SUFFIX_TOKENS = {
+    "CROSS", "HYBRID", "EV", "PHEV", "HEV", "MHEV", "BEV", "RAPTOR",
+    "SUPER", "SPORT", "TURBO", "PREMIUM", "ELECTRIC", "COUPE",
+    "FASTBACK", "CONVERTIBLE", "GT", "AWD", "RWD", "EXTENDED",
+}
+
+
+def is_sku_code_token(tok: str) -> bool:
+    """SKU-suffix detector for proposal H2 (e.g. 'IFBT9AH3')."""
+    return (len(tok) >= 6 and CODE_MODEL_RE.fullmatch(tok) is not None
+            and any(c.isdigit() for c in tok)
+            and any(c.isalpha() for c in tok))
+
+
+def generate_proposal(
+    raw_model_total: dict[tuple[str, str], int],
+    canonical_aliases: dict[tuple[str, str], str],
+) -> tuple[dict[str, dict[str, str]], dict[tuple[str, str, str], str]]:
+    """Build merger proposals using three heuristics.
+
+    Returns:
+      proposals: {brand: {raw_model: canonical_model}}  (only entries
+        NOT already in canonical_aliases).
+      heuristic_by_entry: {(brand, raw, canonical): heuristic_name}
+        for use by the markdown writer.
+    """
+    # Group raw models by brand for the prefix lookup.
+    by_brand: dict[str, set[str]] = defaultdict(set)
+    for (b, m) in raw_model_total:
+        by_brand[b].add(m)
+
+    proposals: dict[str, dict[str, str]] = defaultdict(dict)
+    heuristic_by_entry: dict[tuple[str, str, str], str] = {}
+
+    for brand, models in by_brand.items():
+        models_sorted_by_len = sorted(models, key=len)
+        for m in models:
+            if (brand, m) in canonical_aliases:
+                continue
+
+            # H1 — prefix match (shortest base in the same brand)
+            matched_base: str | None = None
+            for base in models_sorted_by_len:
+                if base == m:
+                    break  # shorter ones come first; stop when we hit M
+                if len(base) >= 3 and m.startswith(base + " "):
+                    matched_base = base
+                    break
+            if matched_base is not None:
+                proposals[brand][m] = matched_base
+                heuristic_by_entry[(brand, m, matched_base)] = "prefix"
+                continue
+
+            tokens = m.split()
+
+            # H2 — strip trailing SKU-code token
+            if len(tokens) >= 2 and is_sku_code_token(tokens[-1]):
+                stripped = " ".join(tokens[:-1])
+                if len(stripped) >= 3:
+                    proposals[brand][m] = stripped
+                    heuristic_by_entry[(brand, m, stripped)] = "sku-suffix"
+                    continue
+
+            # H3 — strip promotional prefix
+            for prefix in ("ALL NEW ", "ALL-NEW ", "NEW ", "GRAND "):
+                if m.startswith(prefix):
+                    stripped = m[len(prefix):].strip()
+                    if len(stripped) >= 3:
+                        proposals[brand][m] = stripped
+                        heuristic_by_entry[(brand, m, stripped)] = (
+                            f"prefix:{prefix.strip()}")
+                        break
+
+    return proposals, heuristic_by_entry
+
+
+def diff_tokens(src: str, dst: str) -> list[str]:
+    """Return the tokens in src that are not in dst (used for the
+    over-merge ⚠ flag in the proposal markdown)."""
+    src_t = src.split()
+    dst_t = dst.split()
+    # If dst is a strict prefix of src, return the suffix tokens
+    if src_t[:len(dst_t)] == dst_t:
+        return src_t[len(dst_t):]
+    # Otherwise just return src tokens not in dst (set diff, order-preserving)
+    s_dst = set(dst_t)
+    return [t for t in src_t if t not in s_dst]
+
+
+def write_proposal_json(proposals: dict[str, dict[str, str]]) -> int:
+    if proposals:
+        out: dict[str, dict[str, str]] = {}
+        for brand in sorted(proposals):
+            out[brand] = {k: proposals[brand][k] for k in sorted(proposals[brand])}
+    else:
+        out = {}
+    MODEL_ALIASES_PROPOSAL_JSON.write_text(
+        json.dumps(out, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return sum(len(v) for v in proposals.values())
+
+
+def write_proposal_md(
+    proposals: dict[str, dict[str, str]],
+    heuristic_by_entry: dict[tuple[str, str, str], str],
+    raw_model_total: dict[tuple[str, str], int],
+) -> None:
+    from datetime import date
+    total_entries = sum(len(v) for v in proposals.values())
+    total_vehicles = sum(
+        raw_model_total.get((b, raw), 0)
+        for b, mapping in proposals.items()
+        for raw in mapping
+    )
+
+    # Rank brands by total vehicle impact (sum of raw units of proposed entries)
+    brand_impact: list[tuple[str, int, int]] = []
+    for brand, mapping in proposals.items():
+        impact = sum(raw_model_total.get((brand, raw), 0) for raw in mapping)
+        brand_impact.append((brand, len(mapping), impact))
+    brand_impact.sort(key=lambda x: (-x[2], x[0]))
+
+    lines: list[str] = []
+    lines.append(f"# Model alias proposal — auto-generated {date.today().isoformat()}")
+    lines.append("")
+    lines.append(
+        f"Total proposals: **{total_entries:,}** across **{len(proposals):,}** brands · "
+        f"would affect **{total_vehicles:,}** vehicle records.")
+    lines.append("")
+    lines.append("Copy approved entries from `model_aliases_proposal.json` into "
+                 "`model_aliases.json`, then re-run `process.py`. The ⚠ marker "
+                 "flags proposals that may over-merge (e.g. `YARIS CROSS → YARIS`) "
+                 "— review carefully.")
+    lines.append("")
+    lines.append("Heuristics: `prefix` = shorter model name exists in same brand; "
+                 "`sku-suffix` = trailing alphanumeric SKU code stripped; "
+                 "`prefix:NEW` / `ALL NEW` / `GRAND` = promotional prefix stripped.")
+    lines.append("")
+
+    for brand, n_entries, impact in brand_impact:
+        lines.append(f"## {brand} — {n_entries:,} proposals · {impact:,} vehicles")
+        lines.append("")
+        lines.append("| Source | → | Canonical | Units | Heuristic | |")
+        lines.append("|---|---|---|---:|---|---|")
+        entries = [
+            (raw, proposals[brand][raw], raw_model_total.get((brand, raw), 0))
+            for raw in proposals[brand]
+        ]
+        entries.sort(key=lambda e: (-e[2], e[0]))
+        for raw, canonical, units in entries:
+            heur = heuristic_by_entry.get((brand, raw, canonical), "?")
+            warn = ""
+            if heur == "prefix":
+                diff = diff_tokens(raw, canonical)
+                if diff and any(t in DISTINCT_SUFFIX_TOKENS for t in diff):
+                    warn = "⚠"
+            lines.append(f"| `{raw}` | → | `{canonical}` | {units:,} | {heur} | {warn} |")
+        lines.append("")
+
+    MODEL_ALIASES_PROPOSAL_MD.write_text("\n".join(lines), encoding="utf-8")
+
+
 def emit_records(b663: dict, b662: dict) -> list[dict]:
     out: list[dict] = []
     for (brand, vt, year, month), n in b663["brand_monthly"].items():
@@ -344,10 +565,43 @@ def main() -> int:
         print(f"ERROR: missing {FILE_10662}", file=sys.stderr)
         return 1
 
-    b663 = read_10663(FILE_10663)
+    aliases = load_model_aliases()
+    print(f"Loaded {len(aliases):,} model-alias mappings from {MODEL_ALIASES_FILE.name}")
+
+    b663 = read_10663(FILE_10663, aliases)
     b662 = read_10662(FILE_10662)
 
     cross_check(b663["brand_yearly"], b662["brand_yearly"])
+
+    # Drop low-volume model rows from MODEL aggregates (keep brand totals).
+    lv_keys = {key for key, total in b663["model_total"].items()
+               if total < MIN_MODEL_VOLUME}
+    if lv_keys:
+        lv_vehicles = sum(b663["model_total"][k] for k in lv_keys)
+        for k in lv_keys:
+            del b663["model_total"][k]
+        # Drop matching entries from model_monthly / model_yearly.
+        b663["model_monthly"] = {
+            k: v for k, v in b663["model_monthly"].items()
+            if (k[0], k[1]) not in lv_keys
+        }
+        b663["model_yearly"] = {
+            k: v for k, v in b663["model_yearly"].items()
+            if (k[0], k[1]) not in lv_keys
+        }
+        print(f"Dropped {len(lv_keys):,} models with <{MIN_MODEL_VOLUME} units "
+              f"({lv_vehicles:,} vehicles) from model aggregates.")
+
+    # --- Build & write merger proposals (review by user, copy into canonical) ---
+    proposals, heuristic_by_entry = generate_proposal(
+        b663["raw_model_total"], aliases)
+    n_proposed = write_proposal_json(proposals)
+    write_proposal_md(proposals, heuristic_by_entry, b663["raw_model_total"])
+    print(f"Wrote {n_proposed:,} merger proposals to "
+          f"{MODEL_ALIASES_PROPOSAL_JSON.name} + "
+          f"{MODEL_ALIASES_PROPOSAL_MD.name}")
+    print(f"  Aliases applied during aggregation: "
+          f"{b663['alias_apply_count']:,}")
 
     records = emit_records(b663, b662)
     meta = emit_meta(b663, b662)

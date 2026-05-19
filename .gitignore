@@ -1,3 +1,5 @@
 .venv/
 .DS_Store
 .planvenv/
+model_aliases_proposal.json
+model_aliases_proposal.md
